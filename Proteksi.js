@@ -1,10 +1,10 @@
 #!/bin/bash
 
-REMOTE_PATH="/var/www/pterodactyl/app/Services/Servers/ServerDeletionService.php"
+REMOTE_PATH="/var/www/pterodactyl/app/Http/Controllers/Admin/LocationController.php"
 TIMESTAMP=$(date -u +"%Y-%m-%d-%H-%M-%S")
 BACKUP_PATH="${REMOTE_PATH}.bak_${TIMESTAMP}"
 
-echo "🚀 Memasang proteksi Anti Delete Server..."
+echo "🚀 Memasang proteksi Anti Akses Location..."
 
 if [ -f "$REMOTE_PATH" ]; then
   mv "$REMOTE_PATH" "$BACKUP_PATH"
@@ -17,108 +17,142 @@ chmod 755 "$(dirname "$REMOTE_PATH")"
 cat > "$REMOTE_PATH" << 'EOF'
 <?php
 
-namespace Pterodactyl\Services\Servers;
+namespace Pterodactyl\Http\Controllers\Admin;
 
+use Illuminate\View\View;
+use Illuminate\Http\RedirectResponse;
 use Illuminate\Support\Facades\Auth;
+use Pterodactyl\Models\Location;
+use Prologue\Alerts\AlertsMessageBag;
+use Illuminate\View\Factory as ViewFactory;
 use Pterodactyl\Exceptions\DisplayException;
-use Illuminate\Http\Response;
-use Pterodactyl\Models\Server;
-use Illuminate\Support\Facades\Log;
-use Illuminate\Database\ConnectionInterface;
-use Pterodactyl\Repositories\Wings\DaemonServerRepository;
-use Pterodactyl\Services\Databases\DatabaseManagementService;
-use Pterodactyl\Exceptions\Http\Connection\DaemonConnectionException;
+use Pterodactyl\Http\Controllers\Controller;
+use Pterodactyl\Http\Requests\Admin\LocationFormRequest;
+use Pterodactyl\Services\Locations\LocationUpdateService;
+use Pterodactyl\Services\Locations\LocationCreationService;
+use Pterodactyl\Services\Locations\LocationDeletionService;
+use Pterodactyl\Contracts\Repository\LocationRepositoryInterface;
 
-class ServerDeletionService
+class LocationController extends Controller
 {
-    protected bool $force = false;
-
     /**
-     * ServerDeletionService constructor.
+     * LocationController constructor.
      */
     public function __construct(
-        private ConnectionInterface $connection,
-        private DaemonServerRepository $daemonServerRepository,
-        private DatabaseManagementService $databaseManagementService
+        protected AlertsMessageBag $alert,
+        protected LocationCreationService $creationService,
+        protected LocationDeletionService $deletionService,
+        protected LocationRepositoryInterface $repository,
+        protected LocationUpdateService $updateService,
+        protected ViewFactory $view
     ) {
     }
 
     /**
-     * Set if the server should be forcibly deleted from the panel (ignoring daemon errors) or not.
+     * Return the location overview page.
      */
-    public function withForce(bool $bool = true): self
+    public function index(): View
     {
-        $this->force = $bool;
-        return $this;
+        // 🔒 Cegah akses selain admin ID 1
+        $user = Auth::user();
+        if (!$user || $user->id !== 1) {
+            abort(403, 'Akses ditolak');
+        }
+
+        return $this->view->make('admin.locations.index', [
+            'locations' => $this->repository->getAllWithDetails(),
+        ]);
     }
 
     /**
-     * Delete a server from the panel and remove any associated databases from hosts.
+     * Return the location view page.
+     *
+     * @throws \Pterodactyl\Exceptions\Repository\RecordNotFoundException
+     */
+    public function view(int $id): View
+    {
+        // 🔒 Cegah akses selain admin ID 1
+        $user = Auth::user();
+        if (!$user || $user->id !== 1) {
+            abort(403, 'Dilarang rusuh disini ! Keamanan by Badol ');
+        }
+
+        return $this->view->make('admin.locations.view', [
+            'location' => $this->repository->getWithNodes($id),
+        ]);
+    }
+
+    /**
+     * Handle request to create new location.
      *
      * @throws \Throwable
+     */
+    public function create(LocationFormRequest $request): RedirectResponse
+    {
+        // 🔒 Cegah akses selain admin ID 1
+        $user = Auth::user();
+        if (!$user || $user->id !== 1) {
+            abort(403, 'BOCAH TOLOL NGINTIP NGINTIP ');
+        }
+
+        $location = $this->creationService->handle($request->normalize());
+        $this->alert->success('Location was created successfully.')->flash();
+
+        return redirect()->route('admin.locations.view', $location->id);
+    }
+
+    /**
+     * Handle request to update or delete location.
+     *
+     * @throws \Throwable
+     */
+    public function update(LocationFormRequest $request, Location $location): RedirectResponse
+    {
+        // 🔒 Cegah akses selain admin ID 1
+        $user = Auth::user();
+        if (!$user || $user->id !== 1) {
+            abort(403, 'BOCAH TOLOL NGINTIP NGINTIP ');
+        }
+
+        if ($request->input('action') === 'delete') {
+            return $this->delete($location);
+        }
+
+        $this->updateService->handle($location->id, $request->normalize());
+        $this->alert->success('Location was updated successfully.')->flash();
+
+        return redirect()->route('admin.locations.view', $location->id);
+    }
+
+    /**
+     * Delete a location from the system.
+     *
+     * @throws \Exception
      * @throws \Pterodactyl\Exceptions\DisplayException
      */
-    public function handle(Server $server): void
+    public function delete(Location $location): RedirectResponse
     {
+        // 🔒 Cegah akses selain admin ID 1
         $user = Auth::user();
-
-        // 🔒 Proteksi: hanya Admin ID = 1 boleh menghapus server siapa saja.
-        // Selain itu, user biasa hanya boleh menghapus server MILIKNYA SENDIRI.
-        // Jika tidak ada informasi pemilik dan pengguna bukan admin, tolak.
-        if ($user) {
-            if ($user->id !== 1) {
-                // Coba deteksi owner dengan beberapa fallback yang umum.
-                $ownerId = $server->owner_id
-                    ?? $server->user_id
-                    ?? ($server->owner?->id ?? null)
-                    ?? ($server->user?->id ?? null);
-
-                if ($ownerId === null) {
-                    // Tidak jelas siapa pemiliknya — jangan izinkan pengguna biasa menghapus.
-                    throw new DisplayException('Akses ditolak: informasi pemilik server tidak tersedia.');
-                }
-
-                if ($ownerId !== $user->id) {
-                    throw new DisplayException('Jangan Del server orang ! Keamanan panel by Walz');
-                }
-            }
-            // jika $user->id === 1, lanjutkan (admin super)
+        if (!$user || $user->id !== 1) {
+            abort(403, 'BOCAH TOLOL NGINTIP NGINTIP ');
         }
-        // Jika tidak ada $user (mis. CLI/background job), biarkan proses berjalan.
 
         try {
-            $this->daemonServerRepository->setServer($server)->delete();
-        } catch (DaemonConnectionException $exception) {
-            // Abaikan error 404, tapi lempar error lain jika tidak mode force
-            if (!$this->force && $exception->getStatusCode() !== Response::HTTP_NOT_FOUND) {
-                throw $exception;
-            }
-
-            Log::warning($exception);
+            $this->deletionService->handle($location->id);
+            return redirect()->route('admin.locations');
+        } catch (DisplayException $ex) {
+            $this->alert->danger($ex->getMessage())->flash();
         }
 
-        $this->connection->transaction(function () use ($server) {
-            foreach ($server->databases as $database) {
-                try {
-                    $this->databaseManagementService->delete($database);
-                } catch (\Exception $exception) {
-                    if (!$this->force) {
-                        throw $exception;
-                    }
-
-                    // Jika gagal delete database di host, tetap hapus dari panel
-                    $database->delete();
-                    Log::warning($exception);
-                }
-            }
-
-            $server->delete();
-        });
+        return redirect()->route('admin.locations.view', $location->id);
     }
 }
 EOF
 
-chmod 644 "$REMOTE_PATH"echo "✅ Proteksi Anti Delete Server berhasil dipasang!"
+chmod 644 "$REMOTE_PATH"
+
+echo "✅ Proteksi Anti Akses Location berhasil dipasang!"
 echo "📂 Lokasi file: $REMOTE_PATH"
 echo "🗂️ Backup file lama: $BACKUP_PATH (jika sebelumnya ada)"
 echo "🔒 Hanya Admin (ID 1) yang bisa hapus server lain."
